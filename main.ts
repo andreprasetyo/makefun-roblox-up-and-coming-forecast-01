@@ -1,3 +1,4 @@
+// Predicts Roblox Up-and-Coming game rankings using a probabilistic diffusion model with drift.
 // A probabilistic diffusion model predicting Roblox experience trajectory and ranking.
 // roblox-up-and-coming-forecast-01 entry (Node 22, standard library only).
 // A diffusion-with-drift forecaster for Roblox's Up-and-Coming chart.
@@ -6,7 +7,11 @@
 // ends is modelled as Normal(current rank + drift(h), sigma(h)):
 //   - drift: the band mean rank change per 24 h, estimated from every pair of
 //     reads ~24 h apart in the history, plus the game's own recent rank
-//     velocity (shrunk: momentum persists, corr ~0.24 in the history);
+//     velocity (shrunk, averaged over two consecutive ~24 h steps) and its
+//     recent log-playing growth (playing growth predicts rank climbs:
+//     forward R^2 0.069 alone, 0.075 with rank velocity; coefficient -3,
+//     shrunk well below the OLS -7.4 because the log score punishes
+//     overconfident drift);
 //   - sigma: the band standard deviation of 24 h rank changes, scaled by
 //     sqrt(h / 24) and by SIGMA_SCALE (the horizon average already spreads
 //     the forecast, so the per-horizon width is narrower than the raw sd).
@@ -23,8 +28,12 @@
 // is given no mass at horizons past its 28th day (that mass flows to the
 // unnamed share, i.e. to the games that replace it).
 //
-// Backtest (walk-forward, 6 folds, mean log score): this model -38.57,
-// persistence baseline -49.68; practice window -33.71 vs baseline -43.51.
+// Backtest (walk-forward, 6 folds each, mean log score): this model
+// -36.94 (spread folds) / -31.87 (late folds); practice window -31.80
+// vs the previous version's -38.57 walk-forward / -33.71 practice and the
+// persistence baseline -49.68 / -43.51. Tuned offline (grid search +
+// walk-forward guard); the recommended config clears the top-10 practice
+// bar (-32.0) and improves on 10 of 11 walk-forward folds.
 // Deterministic: no clock, no randomness; the same history gives the same
 // forecast byte for byte.
 //
@@ -37,7 +46,7 @@ const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 /** Momentum: how much of a game's recent 24 h rank change carries forward. */
-const VEL_SHRINK = 0.25;
+const VEL_SHRINK = 0.1;
 /** Per-horizon width as a fraction of the estimated 24 h rank-change sd. */
 const SIGMA_SCALE = 0.6;
 /** Mass left unnamed at every place, for games the forecast does not name. */
@@ -48,13 +57,15 @@ const BANDS: Array<[number, number]> = [[1, 3], [4, 10], [11, 20], [21, 40], [41
 const DEFAULT_DRIFT = [1.95, 3.94, 6.05, 4.95, -3.22];
 const DEFAULT_SIGMA = [4.12, 8.6, 12.12, 15.69, 19.45];
 /** Horizon grid step, in hours (the window comes from task.json). */
-const HORIZON_STEP = 6;
+const HORIZON_STEP = 3;
 /** A band needs this many pairs before its own estimate replaces the default. */
-const MIN_PAIRS = 20;
+const MIN_PAIRS = 100;
 /** Games are only named at a place when their probability clears this. */
-const MIN_P = 0.001;
+const MIN_P = 0.005;
 /** At most this many rows per place (the rules allow 100). */
 const MAX_ROWS_PER_PLACE = 100;
+/** Log-playing growth per 24 h, in ranks/day (negative: growth climbs). */
+const PLAY_COEF = -3;
 /** The chart only lists games published in the last 28 days. */
 const CHART_MAX_AGE_MS = 28 * 24 * 3600 * 1000;
 
@@ -76,10 +87,11 @@ function bandOf(rank: number): number {
   }
   return BANDS.length - 1;
 }
-
+// Helper function to calculate the arithmetic mean of an array of numbers.
 function mean(xs: number[]): number {
   return xs.reduce((a, b) => a + b, 0) / xs.length;
 }
+
 
 // Computes arithmetic mean across numerical arrays for statistical estimators.
 
@@ -121,12 +133,12 @@ const rankOf = reads.map((r) => {
   return m;
 });
 
-// Band drift/sigma per 24 h, from every pair of reads 20-28 h apart.
+// Band drift/sigma per 24 h, from every pair of reads 16-32 h apart.
 const diffs: number[][] = BANDS.map(() => []);
 for (let i = 0; i < reads.length; i++) {
   for (let j = i + 1; j < reads.length; j++) {
     const dtH = (times[j]! - times[i]!) / 3600000;
-    if (dtH < 20 || dtH > 28) continue;
+    if (dtH < 16 || dtH > 32) continue;
     for (const g of reads[i]!.up_and_coming) {
       const rj = rankOf[j]!.get(g.universe_id);
       if (rj === undefined) continue;
@@ -137,7 +149,9 @@ for (let i = 0; i < reads.length; i++) {
 const drift = diffs.map((d, b) => (d.length >= MIN_PAIRS ? mean(d) : DEFAULT_DRIFT[b]!));
 const sigma = diffs.map((d, b) => (d.length >= MIN_PAIRS ? pstdev(d) : DEFAULT_SIGMA[b]!));
 
-/** A game's rank change per 24 h over its recent past (0 when unknown). */
+/** A game's rank change per 24 h over its recent past (0 when unknown):
+    the mean of two consecutive ~24 h steps, which halves the noise of a
+    single step. */
 function velocity(gid: number): number {
   const idxs: number[] = [];
   for (let i = 0; i < reads.length; i++) if (rankOf[i]!.has(gid)) idxs.push(i);
@@ -153,17 +167,66 @@ function velocity(gid: number): number {
   if (best === -1) best = idxs[idxs.length - 2]!;
   const dt = (times[last]! - times[best]!) / 3600000;
   if (dt <= 0) return 0;
-  return ((rankOf[last]!.get(gid)! - rankOf[best]!.get(gid)!) / dt) * 24;
+  const v1 = ((rankOf[last]!.get(gid)! - rankOf[best]!.get(gid)!) / dt) * 24;
+  if (idxs.length >= 3) {
+    let prev = -1;
+    for (const p of idxs) {
+      if (p >= best) break;
+      const dt2 = (times[best]! - times[p]!) / 3600000;
+      if (dt2 >= 12 && dt2 <= 36) {
+        if (prev === -1 || Math.abs(dt2 - 24) < Math.abs((times[best]! - times[prev]!) / 3600000 - 24)) prev = p;
+      }
+    }
+    if (prev !== -1) {
+      const dt2 = (times[best]! - times[prev]!) / 3600000;
+      if (dt2 > 0) {
+        const v2 = ((rankOf[best]!.get(gid)! - rankOf[prev]!.get(gid)!) / dt2) * 24;
+        return (v1 + v2) / 2;
+      }
+    }
+  }
+  return v1;
 }
 
-// Candidate games: the last chart, plus games seen in the last 7 days that
+/** A game's log-playing change per 24 h over its recent past (0 when
+    unknown): same pairing as velocity. Playing growth is the strongest
+    single predictor of the next day's rank change found in the history. */
+function playVelocity(gid: number): number {
+  const idxs: number[] = [];
+  for (let i = 0; i < reads.length; i++) {
+    for (const g of reads[i]!.up_and_coming) {
+      if (g.universe_id === gid && g.playing) {
+        idxs.push(i);
+        break;
+      }
+    }
+  }
+  if (idxs.length < 2) return 0;
+  const last = idxs[idxs.length - 1]!;
+  let best = -1;
+  for (const p of idxs.slice(0, -1)) {
+    const dt = (times[last]! - times[p]!) / 3600000;
+    if (dt >= 12 && dt <= 36) {
+      if (best === -1 || Math.abs(dt - 24) < Math.abs((times[last]! - times[best]!) / 3600000 - 24)) best = p;
+    }
+  }
+  if (best === -1) best = idxs[idxs.length - 2]!;
+  const dt = (times[last]! - times[best]!) / 3600000;
+  if (dt <= 0) return 0;
+  const pLast = reads[last]!.up_and_coming.find((g) => g.universe_id === gid)!.playing!;
+  const pBest = reads[best]!.up_and_coming.find((g) => g.universe_id === gid)!.playing!;
+  if (!pLast || !pBest || pLast <= 0 || pBest <= 0) return 0;
+  return (Math.log(pLast / pBest) / dt) * 24;
+}
+
+// Candidate games: the last chart, plus games seen in the last 2 days that
 // have since left the chart (they can re-enter; their rank is their last seen).
 const last = reads[reads.length - 1]!;
 const t0 = Date.parse(last.at);
 const candRank = new Map<number, number>();
 for (const g of last.up_and_coming) candRank.set(g.universe_id, g.rank);
 for (const r of reads) {
-  if (t0 - Date.parse(r.at) <= 7 * 86400000) {
+  if (t0 - Date.parse(r.at) <= 2 * 86400000) {
     for (const g of r.up_and_coming) {
       if (!candRank.has(g.universe_id)) candRank.set(g.universe_id, g.rank);
     }
@@ -209,7 +272,7 @@ const placeP: Array<Map<number, number>> = Array.from({ length: places }, () => 
 const expRank = new Map<number, number>();
 for (const [gid, r0] of candRank) {
   const b = bandOf(r0);
-  const d24 = drift[b]! + velocity(gid) * VEL_SHRINK;
+  const d24 = drift[b]! + velocity(gid) * VEL_SHRINK + playVelocity(gid) * PLAY_COEF;
   const s24 = Math.max(2, sigma[b]! * SIGMA_SCALE);
   const dist = new Array<number>(places).fill(0);
   let meanSum = 0;

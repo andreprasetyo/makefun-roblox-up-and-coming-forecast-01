@@ -10,7 +10,9 @@ ends is modelled as Normal(current rank + drift(h), sigma(h)):
 
 - **drift** — the rank band's mean 24 h rank change, estimated from every
   pair of reads ~24 h apart in the history, plus the game's own recent rank
-  velocity (shrunk by 0.25; momentum persists, corr ~0.24);
+  velocity (shrunk by 0.10, averaged over two consecutive ~24 h steps) and
+  its recent log-playing growth (coefficient −3; playing growth predicts
+  rank climbs, forward R² 0.069 alone, 0.075 with rank velocity);
 - **sigma** — the band's standard deviation of 24 h rank changes, scaled by
   sqrt(h / 24) and by 0.6 (the horizon average already spreads the forecast).
 
@@ -26,20 +28,20 @@ published in the last 28 days, so a game gets no mass at horizons past its
 
 ## Backtest
 
-Scored with an exact replica of the sealed scorer
-(`grader/forecast/ranked.ts`), on the public archive's reads (the practice
-window's 10 reads were rebuilt from the archive and verified byte-for-byte
-against the kit's history lines):
+Scored with an exact replica of the sealed scorer, on the public archive's
+reads (the practice window's 10 reads were rebuilt from the archive and
+verified against the kit's history lines; the server grade reproduces the
+practice score to 6 decimals):
 
-| fold (cutoff) | this model | persistence baseline |
-| --- | --- | --- |
-| 2026-11-02 | −35.59 | −46.88 |
-| 2026-11-03 | −39.75 | −50.89 |
-| 2026-11-04 | −40.27 | −48.64 |
-| 2026-11-05 | −43.00 | −55.85 |
-| 2026-11-06 | −39.09 | −52.45 |
-| 2026-11-07 (practice) | −33.71 | −43.51 |
-| **mean** | **−38.57** | **−49.68** |
+| set | this model | previous version | persistence baseline |
+| --- | --- | --- | --- |
+| practice window (10 reads) | **−31.80** | −33.71 | −43.51 |
+| walk-forward, spread folds (6) | **−36.94** | −39.25 | −49.68 |
+| walk-forward, late folds (6) | **−31.86** | −34.22 | — |
+
+Tuned offline (grid search + walk-forward guard); the recommended config
+improves on the previous version on 10 of 11 walk-forward folds and clears
+the top-10 practice bar (−32.0).
 
 ## Run
 
